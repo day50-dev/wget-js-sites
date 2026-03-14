@@ -12,7 +12,23 @@ function usage() {
 Options:
   -rc              Recursive download (follow links)
   -np              No parent — don't ascend to the parent directory
-  --method=CMD     Command to dump HTML to stdout (default uses CDP with a single Chrome instance)
+  -P N             Number of parallel workers (default: 1)
+  -l N             Max recursion depth (default: 5)
+  -w SECONDS       Wait SECONDS between retrievals
+  --waitretry=SECONDS  Wait 1..SECONDS between retries (exponential backoff)
+  --random-wait    Wait from 0.5*WAIT to 1.5*WAIT secs between retrievals
+  -A LIST          Comma-separated list of accepted extensions (e.g., html,pdf)
+  -R LIST          Comma-separated list of rejected extensions (e.g., jpg,png)
+  --accept-regex=REGEX  Regex matching accepted URLs
+  --reject-regex=REGEX  Regex matching rejected URLs
+  --regex-type=TYPE     Regex type: posix (default) or pcre
+  -D LIST          Comma-separated list of accepted domains
+  --exclude-domains=LIST  Comma-separated list of rejected domains
+  -H               Span hosts — follow links to other domains
+  -L               Follow relative links only
+  -I LIST          Include only these directories (comma-separated)
+  -X LIST          Exclude these directories (comma-separated)
+  --method=CMD     Command to dump HTML to stdout (default uses CDP)
   -h, --help       Show this help message`);
   process.exit(1);
 }
@@ -22,7 +38,25 @@ const args = process.argv.slice(2);
 let recursive = false;
 let noParent = false;
 let method = null;
+let parallelism = 1;
+let maxDepth = 5;
+let waitSeconds = 0;
+let waitRetry = 0;
+let randomWait = false;
 let startUrl = null;
+
+// Filter options
+let acceptExts = null;
+let rejectExts = null;
+let acceptRegex = null;
+let rejectRegex = null;
+let regexType = 'posix';
+let allowedDomains = null;
+let excludedDomains = null;
+let spanHosts = false;
+let relativeOnly = false;
+let includeDirs = null;
+let excludeDirs = null;
 
 for (let i = 0; i < args.length; i++) {
   const arg = args[i];
@@ -30,6 +64,58 @@ for (let i = 0; i < args.length; i++) {
     recursive = true;
   } else if (arg === '-np') {
     noParent = true;
+  } else if (arg === '-P') {
+    parallelism = parseInt(args[++i], 10);
+    if (!parallelism || parallelism < 1) {
+      console.error('Error: -P requires a positive integer');
+      process.exit(1);
+    }
+  } else if (arg === '-l') {
+    maxDepth = parseInt(args[++i], 10);
+    if (isNaN(maxDepth) || maxDepth < 0) {
+      console.error('Error: -l requires a non-negative integer');
+      process.exit(1);
+    }
+  } else if (arg === '-w') {
+    waitSeconds = parseFloat(args[++i]);
+    if (isNaN(waitSeconds) || waitSeconds < 0) {
+      console.error('Error: -w requires a non-negative number');
+      process.exit(1);
+    }
+  } else if (arg.startsWith('--waitretry=')) {
+    waitRetry = parseFloat(arg.slice('--waitretry='.length));
+    if (isNaN(waitRetry) || waitRetry < 0) {
+      console.error('Error: --waitretry requires a non-negative number');
+      process.exit(1);
+    }
+  } else if (arg === '--random-wait') {
+    randomWait = true;
+  } else if (arg === '-A') {
+    acceptExts = args[++i].split(',').map(s => s.trim().toLowerCase()).filter(Boolean);
+  } else if (arg === '-R') {
+    rejectExts = args[++i].split(',').map(s => s.trim().toLowerCase()).filter(Boolean);
+  } else if (arg.startsWith('--accept-regex=')) {
+    acceptRegex = arg.slice('--accept-regex='.length);
+  } else if (arg.startsWith('--reject-regex=')) {
+    rejectRegex = arg.slice('--reject-regex='.length);
+  } else if (arg.startsWith('--regex-type=')) {
+    regexType = arg.slice('--regex-type='.length);
+    if (regexType !== 'posix' && regexType !== 'pcre') {
+      console.error('Error: --regex-type must be posix or pcre');
+      process.exit(1);
+    }
+  } else if (arg === '-D') {
+    allowedDomains = args[++i].split(',').map(s => s.trim().toLowerCase()).filter(Boolean);
+  } else if (arg.startsWith('--exclude-domains=')) {
+    excludedDomains = arg.slice('--exclude-domains='.length).split(',').map(s => s.trim().toLowerCase()).filter(Boolean);
+  } else if (arg === '-H' || arg === '--span-hosts') {
+    spanHosts = true;
+  } else if (arg === '-L' || arg === '--relative') {
+    relativeOnly = true;
+  } else if (arg === '-I') {
+    includeDirs = args[++i].split(',').map(s => s.trim()).filter(Boolean);
+  } else if (arg === '-X') {
+    excludeDirs = args[++i].split(',').map(s => s.trim()).filter(Boolean);
   } else if (arg.startsWith('--method=')) {
     method = arg.slice('--method='.length);
   } else if (arg === '--method') {
@@ -55,7 +141,7 @@ if (!/^https?:\/\//i.test(startUrl)) {
 
 const startParsed = new URL(startUrl);
 
-// --- CDP browser session (single Chrome instance) ---
+// --- CDP browser session ---
 
 function launchChrome() {
   return new Promise((resolve, reject) => {
@@ -84,48 +170,48 @@ function launchChrome() {
   });
 }
 
-function cdpSend(ws, method, params = {}) {
+function cdpSend(session, method, params = {}) {
   return new Promise((resolve, reject) => {
-    const id = cdpSend._nextId = (cdpSend._nextId || 0) + 1;
+    const id = ++session._nextId;
     const handler = (ev) => {
       const msg = JSON.parse(ev.data);
       if (msg.id === id) {
-        ws.removeEventListener('message', handler);
+        session.ws.removeEventListener('message', handler);
         if (msg.error) reject(new Error(msg.error.message));
         else resolve(msg.result);
       }
     };
-    ws.addEventListener('message', handler);
-    ws.send(JSON.stringify({ id, method, params }));
+    session.ws.addEventListener('message', handler);
+    session.ws.send(JSON.stringify({ id, method, params }));
   });
 }
 
-function cdpWaitEvent(ws, eventName, timeout = 30000) {
+function cdpWaitEvent(session, eventName, timeout = 30000) {
   return new Promise((resolve, reject) => {
     const timer = setTimeout(() => {
-      ws.removeEventListener('message', handler);
+      session.ws.removeEventListener('message', handler);
       reject(new Error(`Timeout waiting for ${eventName}`));
     }, timeout);
     const handler = (ev) => {
       const msg = JSON.parse(ev.data);
       if (msg.method === eventName) {
         clearTimeout(timer);
-        ws.removeEventListener('message', handler);
+        session.ws.removeEventListener('message', handler);
         resolve(msg.params);
       }
     };
-    ws.addEventListener('message', handler);
+    session.ws.addEventListener('message', handler);
   });
 }
 
-function httpJson(url, method = 'GET') {
+function httpJson(url, reqMethod = 'GET') {
   return new Promise((resolve, reject) => {
     const parsed = new URL(url);
     const req = http.request({
       hostname: parsed.hostname,
       port: parsed.port,
       path: parsed.pathname + parsed.search,
-      method,
+      method: reqMethod,
     }, (res) => {
       let body = '';
       res.on('data', (c) => body += c);
@@ -143,7 +229,6 @@ async function createCdpSession(browserWsUrl) {
   const parsed = new URL(browserWsUrl);
   const base = `http://${parsed.host}`;
 
-  // Open a new tab via PUT (required by newer Chrome)
   const target = await httpJson(`${base}/json/new?about:blank`, 'PUT');
   const pageWsUrl = target.webSocketDebuggerUrl;
 
@@ -153,27 +238,52 @@ async function createCdpSession(browserWsUrl) {
     ws.addEventListener('error', reject);
   });
 
-  await cdpSend(ws, 'Page.enable');
-  return { ws, targetId: target.id, base };
+  const session = { ws, _nextId: 0 };
+  await cdpSend(session, 'Page.enable');
+  await cdpSend(session, 'Network.enable');
+  return session;
 }
 
 async function cdpFetchPage(session, url) {
-  const { ws } = session;
-  const loadPromise = cdpWaitEvent(ws, 'Page.loadEventFired');
-  await cdpSend(ws, 'Page.navigate', { url });
+  // Capture the raw HTML response for link extraction
+  let rawSource = null;
+  const responseHandler = (ev) => {
+    const msg = JSON.parse(ev.data);
+    if (msg.method === 'Network.responseReceived') {
+      const resp = msg.params.response;
+      if (resp.url === url && resp.mimeType && resp.mimeType.includes('html')) {
+        session._mainRequestId = msg.params.requestId;
+      }
+    }
+  };
+  session.ws.addEventListener('message', responseHandler);
+
+  const loadPromise = cdpWaitEvent(session, 'Page.loadEventFired');
+  await cdpSend(session, 'Page.navigate', { url });
   await loadPromise;
-  // Small delay for JS-rendered content to settle
+
+  session.ws.removeEventListener('message', responseHandler);
+
+  // Get the raw source from the network response
+  if (session._mainRequestId) {
+    try {
+      const body = await cdpSend(session, 'Network.getResponseBody', {
+        requestId: session._mainRequestId,
+      });
+      rawSource = body.base64Encoded
+        ? Buffer.from(body.body, 'base64').toString('utf-8')
+        : body.body;
+    } catch {}
+    session._mainRequestId = null;
+  }
+
   await new Promise((r) => setTimeout(r, 200));
-  const result = await cdpSend(ws, 'Runtime.evaluate', {
+  const result = await cdpSend(session, 'Runtime.evaluate', {
     expression: 'document.documentElement.outerHTML',
     returnByValue: true,
   });
-  return result.result.value;
-}
-
-async function closeCdpSession(session, chromeProc) {
-  try { session.ws.close(); } catch {}
-  try { chromeProc.kill(); } catch {}
+  const rendered = result.result.value;
+  return { rendered, rawSource: rawSource || rendered };
 }
 
 // --- Fallback: exec per invocation for custom --method ---
@@ -181,11 +291,12 @@ async function closeCdpSession(session, chromeProc) {
 function execFetchPage(url) {
   const cmd = `${method} '${url.replace(/'/g, "'\\''")}'`;
   try {
-    return execSync(cmd, {
+    const html = execSync(cmd, {
       encoding: 'utf-8',
       timeout: 30000,
       stdio: ['pipe', 'pipe', 'pipe'],
     });
+    return { rendered: html, rawSource: html };
   } catch (e) {
     console.error(`  Failed to fetch: ${url}`);
     return null;
@@ -194,17 +305,79 @@ function execFetchPage(url) {
 
 // --- Shared utilities ---
 
+// Wait function implementing wget-style timing options
+// - waitSeconds: base wait time between retrievals
+// - waitRetry: for retries, wait 1..waitRetry seconds (exponential backoff style)
+// - randomWait: if true, randomize wait time to 0.5*wait..1.5*wait
+// - attempt: which retry attempt this is (1-based, used for waitretry backoff)
+function applyWait(attempt = 1) {
+  return new Promise((resolve) => {
+    let waitTime = waitSeconds;
+
+    // Apply randomization if --random-wait is set
+    if (randomWait && waitTime > 0) {
+      const variance = waitTime * 0.5;
+      waitTime = waitTime - variance + (Math.random() * variance * 2);
+    }
+
+    // Apply waitretry backoff for retries (attempt > 1)
+    if (waitRetry > 0 && attempt > 1) {
+      // Cap at waitRetry, minimum of 1 second
+      const backoffWait = Math.min(waitRetry, Math.max(1, attempt));
+      waitTime = Math.max(waitTime, backoffWait);
+    }
+
+    if (waitTime > 0) {
+      setTimeout(resolve, waitTime * 1000);
+    } else {
+      resolve();
+    }
+  });
+}
+
 function urlToFilePath(urlStr) {
   const parsed = new URL(urlStr);
   let pathname = parsed.pathname;
   if (pathname.endsWith('/')) pathname += 'index.html';
-  if (!path.extname(pathname)) pathname += '/index.html';
   return path.join(parsed.hostname, pathname);
 }
 
+// When saving a file, if the path conflicts with an existing directory,
+// append .1 like wget does
+function resolveConflict(filePath) {
+  if (fs.existsSync(filePath)) {
+    const stat = fs.statSync(filePath);
+    if (stat.isDirectory()) {
+      return filePath + '.1';
+    }
+  }
+  return filePath;
+}
+
+// When creating a directory, if a file already exists at that path,
+// rename the file with .1 suffix like wget does
+function ensureDir(dirPath) {
+  const parts = dirPath.split(path.sep);
+  let current = '';
+  for (const part of parts) {
+    current = current ? path.join(current, part) : part;
+    if (fs.existsSync(current)) {
+      const stat = fs.statSync(current);
+      if (stat.isFile()) {
+        const renamed = current + '.1';
+        fs.renameSync(current, renamed);
+        console.log(`  Renamed: ${current} -> ${renamed} (conflict)`);
+        fs.mkdirSync(current);
+      }
+    }
+  }
+  fs.mkdirSync(dirPath, { recursive: true });
+}
+
 function savePage(urlStr, html) {
-  const filePath = urlToFilePath(urlStr);
-  fs.mkdirSync(path.dirname(filePath), { recursive: true });
+  let filePath = urlToFilePath(urlStr);
+  ensureDir(path.dirname(filePath));
+  filePath = resolveConflict(filePath);
   fs.writeFileSync(filePath, html, 'utf-8');
   console.log(`  Saved: ${filePath}`);
 }
@@ -214,32 +387,150 @@ function extractLinks(html, baseUrl) {
   const hrefRegex = /href\s*=\s*["']([^"'#]+)/gi;
   let match;
   while ((match = hrefRegex.exec(html)) !== null) {
-    try { links.add(new URL(match[1], baseUrl).href); }
+    const raw = match[1];
+    // Skip relative links (./foo, ../foo, bare paths) — SPA navigation
+    // artifacts. Only follow absolute-path (/foo) or full URL hrefs.
+    if (!raw.startsWith('/') && !raw.startsWith('http://') && !raw.startsWith('https://')) {
+      continue;
+    }
+    try { links.add(new URL(raw, baseUrl).href); }
     catch {}
   }
   return links;
 }
 
+function hasPathCycle(pathname) {
+  // Detect repeating path segment patterns like /a/b/a/b/
+  const parts = pathname.split('/').filter(Boolean);
+  for (let len = 1; len <= parts.length / 2; len++) {
+    for (let start = 0; start + len * 2 <= parts.length; start++) {
+      const seg = parts.slice(start, start + len).join('/');
+      const next = parts.slice(start + len, start + len * 2).join('/');
+      if (seg === next) return true;
+    }
+  }
+  return false;
+}
+
+// --- URL Filtering ---
+
+function matchRegex(str, pattern, type) {
+  try {
+    if (type === 'pcre') {
+      return new RegExp(pattern).test(str);
+    } else {
+      // POSIX-style: convert basic patterns to JS regex
+      // Handle * as .* and ? as .
+      const converted = pattern
+        .replace(/[.+^${}()|[\]\\]/g, '\\$&')  // escape special chars
+        .replace(/\*/g, '.*')                  // * matches anything
+        .replace(/\?/g, '.');                  // ? matches single char
+      return new RegExp(converted).test(str);
+    }
+  } catch {
+    return false;
+  }
+}
+
+function matchDirectory(urlPath, dirList) {
+  // Check if URL path starts with any of the directories in the list
+  // Directories should end with / for proper prefix matching
+  for (let dir of dirList) {
+    if (!dir.endsWith('/')) dir += '/';
+    if (urlPath.startsWith(dir) || urlPath === dir.slice(0, -1)) {
+      return true;
+    }
+  }
+  return false;
+}
+
 function shouldFollow(urlStr) {
   try {
     const parsed = new URL(urlStr);
-    if (parsed.hostname !== startParsed.hostname) return false;
-    if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') return false;
+
+    // Protocol check
+    if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') {
+      return false;
+    }
+
+    // -L: relative links only - skip absolute URLs to other hosts or different base
+    if (relativeOnly) {
+      if (parsed.hostname !== startParsed.hostname) return false;
+    }
+
+    // -H span-hosts: if NOT set, only follow same-host links
+    if (!spanHosts && parsed.hostname !== startParsed.hostname) {
+      return false;
+    }
+
+    // Domain filtering: -D (allowed domains)
+    if (allowedDomains && !allowedDomains.includes(parsed.hostname.toLowerCase())) {
+      return false;
+    }
+
+    // Domain filtering: --exclude-domains
+    if (excludedDomains && excludedDomains.includes(parsed.hostname.toLowerCase())) {
+      return false;
+    }
+
+    // -np: no parent directory check
     if (noParent) {
       let basePath = startParsed.pathname;
       if (!basePath.endsWith('/')) basePath = path.posix.dirname(basePath) + '/';
       if (!parsed.pathname.startsWith(basePath)) return false;
     }
-    const ext = path.extname(parsed.pathname).toLowerCase();
-    const skip = [
-      '.png', '.jpg', '.jpeg', '.gif', '.svg', '.ico', '.webp',
-      '.css', '.js', '.woff', '.woff2', '.ttf', '.eot',
-      '.pdf', '.zip', '.tar', '.gz', '.mp3', '.mp4', '.avi',
-      '.mov', '.xml', '.json', '.rss', '.atom',
-    ];
-    if (skip.includes(ext)) return false;
+
+    // -I: include directories
+    if (includeDirs && !matchDirectory(parsed.pathname, includeDirs)) {
+      return false;
+    }
+
+    // -X: exclude directories
+    if (excludeDirs && matchDirectory(parsed.pathname, excludeDirs)) {
+      return false;
+    }
+
+    // Extension filtering: -A (accept)
+    if (acceptExts) {
+      const ext = path.extname(parsed.pathname).toLowerCase().replace(/^\./, '');
+      if (!acceptExts.includes(ext)) return false;
+    }
+
+    // Extension filtering: -R (reject)
+    if (rejectExts) {
+      const ext = path.extname(parsed.pathname).toLowerCase().replace(/^\./, '');
+      if (rejectExts.includes(ext)) return false;
+    }
+
+    // Regex filtering: --accept-regex
+    if (acceptRegex && !matchRegex(urlStr, acceptRegex, regexType)) {
+      return false;
+    }
+
+    // Regex filtering: --reject-regex
+    if (rejectRegex && matchRegex(urlStr, rejectRegex, regexType)) {
+      return false;
+    }
+
+    // Cycle detection
+    if (hasPathCycle(parsed.pathname)) return false;
+
+    // Default static asset skip (only if no explicit accept list)
+    if (!acceptExts) {
+      const ext = path.extname(parsed.pathname).toLowerCase();
+      const skip = [
+        '.png', '.jpg', '.jpeg', '.gif', '.svg', '.ico', '.webp',
+        '.css', '.js', '.woff', '.woff2', '.ttf', '.eot',
+        '.zip', '.tar', '.gz', '.mp3', '.mp4', '.avi',
+        '.mov', '.xml', '.json', '.rss', '.atom',
+      ];
+      if (skip.includes(ext)) return false;
+    }
+
     return true;
-  } catch { return false; }
+  } catch {
+    return false;
+  }
 }
 
 function normalizeUrl(urlStr) {
@@ -248,75 +539,182 @@ function normalizeUrl(urlStr) {
   return parsed.href;
 }
 
-// --- Main ---
+// --- Work queue with wait/notify ---
+
+class WorkQueue {
+  constructor() {
+    this._items = [];
+    this._waiters = [];
+    this._done = false;
+  }
+
+  push(url) {
+    this._items.push(url);
+    if (this._waiters.length > 0) {
+      this._waiters.shift()();
+    }
+  }
+
+  // Returns a URL or null if done
+  async take() {
+    while (true) {
+      if (this._items.length > 0) return this._items.shift();
+      if (this._done) return null;
+      await new Promise((resolve) => this._waiters.push(resolve));
+    }
+  }
+
+  finish() {
+    this._done = true;
+    for (const wake of this._waiters) wake();
+    this._waiters = [];
+  }
+
+  get length() { return this._items.length; }
+}
+
+// --- Worker pool ---
 
 async function main() {
   const useCdp = !method;
-  let chromeProc, session, fetchPage;
 
   console.log(`Starting download from: ${startUrl}`);
   if (recursive) console.log('Recursive mode enabled');
   if (noParent) console.log('No-parent mode enabled');
+  console.log(`Workers: ${parallelism}`);
+
+  // Shared state
+  const visited = new Set();
+  const queue = new WorkQueue();
+  const firstUrl = normalizeUrl(startUrl);
+  visited.add(firstUrl);
+  queue.push({ url: firstUrl, depth: 0 });
+
+  // Launch Chrome instances (one per worker) if using CDP
+  const chromeProcs = [];
+  const sessions = [];
+
+  // Cleanup function to kill all Chrome processes
+  function cleanup() {
+    for (const s of sessions) { try { s.ws.close(); } catch {} }
+    for (const p of chromeProcs) { try { p.kill('SIGTERM'); } catch {} }
+    // Force kill after a short delay if still running
+    setTimeout(() => {
+      for (const p of chromeProcs) { try { p.kill('SIGKILL'); } catch {} }
+    }, 1000);
+  }
+
+  // Register cleanup handlers
+  process.on('exit', cleanup);
+  process.on('SIGINT', () => { cleanup(); process.exit(130); });
+  process.on('SIGTERM', () => { cleanup(); process.exit(143); });
+  process.on('uncaughtException', (err) => {
+    console.error('Uncaught exception:', err.message);
+    cleanup();
+    process.exit(1);
+  });
 
   if (useCdp) {
-    console.log('Method: CDP (single Chrome instance)');
-    console.log('Launching Chrome...');
-    const { proc, wsUrl } = await launchChrome();
-    chromeProc = proc;
-    session = await createCdpSession(wsUrl);
-    console.log('Chrome ready.\n');
-    fetchPage = (url) => cdpFetchPage(session, url).catch((e) => {
-      console.error(`  Failed to fetch: ${url} — ${e.message}`);
-      return null;
-    });
+    console.log(`Launching ${parallelism} Chrome instance(s)...`);
+    const launches = [];
+    for (let i = 0; i < parallelism; i++) {
+      launches.push(launchChrome().then(async ({ proc, wsUrl }) => {
+        chromeProcs.push(proc);
+        const session = await createCdpSession(wsUrl);
+        sessions.push(session);
+      }));
+    }
+    await Promise.all(launches);
+    console.log('All Chrome instances ready.\n');
   } else {
-    console.log(`Method: ${method}`);
-    console.log('');
-    fetchPage = execFetchPage;
+    console.log(`Method: ${method}\n`);
   }
 
-  const visited = new Set();
-  const queue = [normalizeUrl(startUrl)];
+  let downloaded = 0;
+  let idleCount = 0;
 
-  while (queue.length > 0) {
-    const url = queue.shift();
-    if (visited.has(url)) continue;
-    visited.add(url);
+  function enqueueLinks(html, baseUrl, depth) {
+    if (depth >= maxDepth) return;
+    for (const link of extractLinks(html, baseUrl)) {
+      const normalized = normalizeUrl(link);
+      if (!visited.has(normalized) && shouldFollow(normalized)) {
+        visited.add(normalized);
+        queue.push({ url: normalized, depth: depth + 1 });
+      }
+    }
+  }
 
-    const filePath = urlToFilePath(url);
-    if (fs.existsSync(filePath)) {
-      console.log(`Skipping (exists): ${url}`);
+  function makeFetchPage(workerIdx) {
+    if (useCdp) {
+      const session = sessions[workerIdx];
+      return (url) => cdpFetchPage(session, url).catch((e) => {
+        console.error(`  [W${workerIdx}] Failed to fetch: ${url} — ${e.message}`);
+        return null;
+      });
+    } else {
+      return execFetchPage;
+    }
+  }
+
+  async function worker(workerIdx) {
+    const fetchPage = makeFetchPage(workerIdx);
+    let lastDownloadTime = 0;
+
+    while (true) {
+      // Yield before checking queue so other workers get a chance to wake
+      await new Promise((r) => setImmediate(r));
+
+      // Mark idle before waiting for work
+      idleCount++;
+      if (idleCount === parallelism && queue.length === 0) {
+        // All workers idle and queue empty — we're done
+        queue.finish();
+      }
+
+      const item = await queue.take();
+      idleCount--;
+      if (item === null) break;
+      const { url, depth } = item;
+
+      const filePath = urlToFilePath(url);
+      if (fs.existsSync(filePath)) {
+        console.log(`[W${workerIdx}] Skipping (exists): ${url}`);
+        if (recursive) {
+          const html = fs.readFileSync(filePath, 'utf-8');
+          enqueueLinks(html, url, depth);
+        }
+        continue;
+      }
+
+      // Apply wait between retrievals (only if there was a previous download)
+      if (lastDownloadTime > 0 && (waitSeconds > 0 || randomWait)) {
+        await applyWait();
+      }
+
+      console.log(`[W${workerIdx}] Fetching: ${url}`);
+      const result = await fetchPage(url);
+      if (!result) continue;
+
+      savePage(url, result.rendered);
+      downloaded++;
+      lastDownloadTime = Date.now();
+
       if (recursive) {
-        const html = fs.readFileSync(filePath, 'utf-8');
-        for (const link of extractLinks(html, url)) {
-          const normalized = normalizeUrl(link);
-          if (!visited.has(normalized) && shouldFollow(normalized)) {
-            queue.push(normalized);
-          }
-        }
-      }
-      continue;
-    }
-
-    console.log(`Fetching: ${url}`);
-    const html = await fetchPage(url);
-    if (!html) continue;
-
-    savePage(url, html);
-
-    if (recursive) {
-      for (const link of extractLinks(html, url)) {
-        const normalized = normalizeUrl(link);
-        if (!visited.has(normalized) && shouldFollow(normalized)) {
-          queue.push(normalized);
-        }
+        enqueueLinks(result.rendered, url, depth);
       }
     }
   }
 
-  console.log(`\nDone. Downloaded ${visited.size} page(s).`);
+  // Start all workers concurrently
+  const workers = [];
+  for (let i = 0; i < parallelism; i++) {
+    workers.push(worker(i));
+  }
+  await Promise.all(workers);
 
-  if (useCdp) await closeCdpSession(session, chromeProc);
+  console.log(`\nDone. Downloaded ${downloaded} page(s), ${visited.size} total visited.`);
+
+  // Cleanup is handled by process exit handlers
 }
 
 main().catch((e) => {
