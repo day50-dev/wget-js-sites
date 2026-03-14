@@ -74,6 +74,7 @@ wgetjs -rc --post='markitdown {} > {}.md' http://example.com/
 
 | Option | Description |
 |--------|-------------|
+| `-E`, `--adjust-extension` | Append `.html` to filenames that don't already have an HTML extension |
 | `--method=CMD` | Custom command to fetch HTML (alternative to Chrome) |
 | `-h, --help` | Show help |
 

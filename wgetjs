@@ -42,6 +42,7 @@ URL Filtering:
   --post=CMD            Run CMD after each download ({} = downloaded file path)
 
 Other:
+  -E, --adjust-extension  Append .html to filenames that don't already have it
   --method=CMD          Custom fetch command ({} = URL, appended by default)
   -h, --help              Show this help message
 
@@ -61,7 +62,7 @@ Examples:
 // We need to include all single-letter flags as booleans to prevent them
 // from consuming subsequent arguments as values
 const opts = getopts(process.argv.slice(2), {
-  boolean: ['r', 'c', 'n', 'p', 'H', 'L', 'random-wait', 'ignore-case', 'h', 'help'],
+  boolean: ['r', 'c', 'n', 'p', 'H', 'L', 'E', 'random-wait', 'ignore-case', 'h', 'help'],
   string: ['P', 'workers', 'l', 'level', 'w', 'wait', 'waitretry', 'A', 'accept', 'R', 'reject',
     'accept-regex', 'reject-regex', 'regex-type', 'D', 'domains', 'exclude-domains',
     'I', 'include-dirs', 'X', 'exclude-dirs', 'post', 'method'],
@@ -79,6 +80,7 @@ const opts = getopts(process.argv.slice(2), {
     'L': ['relative'],
     'I': ['include-dirs'],
     'X': ['exclude-dirs'],
+    'E': ['adjust-extension'],
     'h': ['help'],
   },
   default: {
@@ -123,6 +125,7 @@ const postCommand = opts.post;
 const spanHosts = opts.H;
 const relativeOnly = opts.L;
 const ignoreCase = opts['ignore-case'];
+const adjustExtension = opts.E;
 
 // Filter options - handle arrays and comma-separated values
 const acceptExts = opts.accept ? opts.accept.split(',').map(s => s.trim().toLowerCase()).filter(Boolean) : null;
@@ -263,12 +266,14 @@ async function createCdpSession(browserWsUrl) {
 async function cdpFetchPage(session, url) {
   // Capture the raw HTML response for link extraction
   let rawSource = null;
+  let mimeType = null;
   const responseHandler = (ev) => {
     const msg = JSON.parse(ev.data);
     if (msg.method === 'Network.responseReceived') {
       const resp = msg.params.response;
       if (resp.url === url && resp.mimeType && resp.mimeType.includes('html')) {
         session._mainRequestId = msg.params.requestId;
+        mimeType = resp.mimeType;
       }
     }
   };
@@ -299,7 +304,7 @@ async function cdpFetchPage(session, url) {
     returnByValue: true,
   });
   const rendered = result.result.value;
-  return { rendered, rawSource: rawSource || rendered };
+  return { rendered, rawSource: rawSource || rendered, mimeType };
 }
 
 // --- Fallback: exec per invocation for custom --method ---
@@ -397,8 +402,13 @@ function ensureDir(dirPath) {
   fs.mkdirSync(dirPath, { recursive: true });
 }
 
-function savePage(urlStr, html) {
+function savePage(urlStr, html, mimeType) {
   let filePath = urlToFilePath(urlStr);
+  if (adjustExtension && mimeType &&
+      (mimeType.includes('text/html') || mimeType.includes('application/xhtml+xml')) &&
+      !/\.[Hh][Tt][Mm][Ll]?$/.test(filePath)) {
+    filePath += '.html';
+  }
   ensureDir(path.dirname(filePath));
   filePath = resolveConflict(filePath);
   fs.writeFileSync(filePath, html, 'utf-8');
@@ -770,7 +780,7 @@ async function main() {
       const result = await fetchPage(url);
 
       if (result) {
-        const savedPath = savePage(url, result.rendered);
+        const savedPath = savePage(url, result.rendered, result.mimeType);
         runPostProcess(savedPath);
         downloaded++;
         lastDownloadTime = Date.now();
