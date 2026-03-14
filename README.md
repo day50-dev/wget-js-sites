@@ -2,7 +2,7 @@
 
 `wget` and `curl` can't deal with Javascript. You know this, I know this, the whole internet knows this. 
 
-Why do we have to write code to `wget -rc` a site with Javascript? So stupid.
+Why do we have to write code to `wget -r` a site with Javascript? So stupid.
 
 Finally, here is a **wget for SPAs and JS sites.** About fucking time.
 
