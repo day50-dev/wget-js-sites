@@ -8,6 +8,9 @@ const path = require('path');
 const { quote: shellEscape } = require('shell-quote');
 const getopts = require('getopts');
 
+// Debug: print argv to see what's happening
+// console.error('DEBUG argv:', JSON.stringify(process.argv));
+
 function usage() {
   console.error(`wgetjs - wget for SPAs and JavaScript-heavy websites
 
