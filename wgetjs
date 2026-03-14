@@ -1,0 +1,325 @@
+#!/usr/bin/env node
+
+const { spawn, execSync } = require('child_process');
+const { URL } = require('url');
+const http = require('http');
+const fs = require('fs');
+const path = require('path');
+
+function usage() {
+  console.error(`Usage: wgetjs [options] <url>
+
+Options:
+  -rc              Recursive download (follow links)
+  -np              No parent — don't ascend to the parent directory
+  --method=CMD     Command to dump HTML to stdout (default uses CDP with a single Chrome instance)
+  -h, --help       Show this help message`);
+  process.exit(1);
+}
+
+// Parse arguments
+const args = process.argv.slice(2);
+let recursive = false;
+let noParent = false;
+let method = null;
+let startUrl = null;
+
+for (let i = 0; i < args.length; i++) {
+  const arg = args[i];
+  if (arg === '-rc' || arg === '-r') {
+    recursive = true;
+  } else if (arg === '-np') {
+    noParent = true;
+  } else if (arg.startsWith('--method=')) {
+    method = arg.slice('--method='.length);
+  } else if (arg === '--method') {
+    method = args[++i];
+  } else if (arg === '-h' || arg === '--help') {
+    usage();
+  } else if (!arg.startsWith('-')) {
+    startUrl = arg;
+  } else {
+    console.error(`Unknown option: ${arg}`);
+    usage();
+  }
+}
+
+if (!startUrl) {
+  console.error('Error: URL is required');
+  usage();
+}
+
+if (!/^https?:\/\//i.test(startUrl)) {
+  startUrl = 'http://' + startUrl;
+}
+
+const startParsed = new URL(startUrl);
+
+// --- CDP browser session (single Chrome instance) ---
+
+function launchChrome() {
+  return new Promise((resolve, reject) => {
+    const proc = spawn('google-chrome', [
+      '--headless',
+      '--disable-gpu',
+      '--no-sandbox',
+      '--remote-debugging-port=0',
+    ], { stdio: ['pipe', 'pipe', 'pipe'] });
+
+    let stderr = '';
+    proc.stderr.on('data', (chunk) => {
+      stderr += chunk.toString();
+      const match = stderr.match(/DevTools listening on (ws:\/\/[^\s]+)/);
+      if (match) {
+        resolve({ proc, wsUrl: match[1] });
+      }
+    });
+    proc.on('error', reject);
+    proc.on('exit', (code) => {
+      if (!stderr.includes('DevTools listening on')) {
+        reject(new Error(`Chrome exited (${code}) before reporting DevTools URL.\n${stderr}`));
+      }
+    });
+    setTimeout(() => reject(new Error('Chrome launch timed out')), 15000);
+  });
+}
+
+function cdpSend(ws, method, params = {}) {
+  return new Promise((resolve, reject) => {
+    const id = cdpSend._nextId = (cdpSend._nextId || 0) + 1;
+    const handler = (ev) => {
+      const msg = JSON.parse(ev.data);
+      if (msg.id === id) {
+        ws.removeEventListener('message', handler);
+        if (msg.error) reject(new Error(msg.error.message));
+        else resolve(msg.result);
+      }
+    };
+    ws.addEventListener('message', handler);
+    ws.send(JSON.stringify({ id, method, params }));
+  });
+}
+
+function cdpWaitEvent(ws, eventName, timeout = 30000) {
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(() => {
+      ws.removeEventListener('message', handler);
+      reject(new Error(`Timeout waiting for ${eventName}`));
+    }, timeout);
+    const handler = (ev) => {
+      const msg = JSON.parse(ev.data);
+      if (msg.method === eventName) {
+        clearTimeout(timer);
+        ws.removeEventListener('message', handler);
+        resolve(msg.params);
+      }
+    };
+    ws.addEventListener('message', handler);
+  });
+}
+
+function httpJson(url, method = 'GET') {
+  return new Promise((resolve, reject) => {
+    const parsed = new URL(url);
+    const req = http.request({
+      hostname: parsed.hostname,
+      port: parsed.port,
+      path: parsed.pathname + parsed.search,
+      method,
+    }, (res) => {
+      let body = '';
+      res.on('data', (c) => body += c);
+      res.on('end', () => {
+        try { resolve(JSON.parse(body)); }
+        catch (e) { reject(new Error(`Bad JSON from ${url}: ${body.slice(0, 200)}`)); }
+      });
+    });
+    req.on('error', reject);
+    req.end();
+  });
+}
+
+async function createCdpSession(browserWsUrl) {
+  const parsed = new URL(browserWsUrl);
+  const base = `http://${parsed.host}`;
+
+  // Open a new tab via PUT (required by newer Chrome)
+  const target = await httpJson(`${base}/json/new?about:blank`, 'PUT');
+  const pageWsUrl = target.webSocketDebuggerUrl;
+
+  const ws = new WebSocket(pageWsUrl);
+  await new Promise((resolve, reject) => {
+    ws.addEventListener('open', resolve);
+    ws.addEventListener('error', reject);
+  });
+
+  await cdpSend(ws, 'Page.enable');
+  return { ws, targetId: target.id, base };
+}
+
+async function cdpFetchPage(session, url) {
+  const { ws } = session;
+  const loadPromise = cdpWaitEvent(ws, 'Page.loadEventFired');
+  await cdpSend(ws, 'Page.navigate', { url });
+  await loadPromise;
+  // Small delay for JS-rendered content to settle
+  await new Promise((r) => setTimeout(r, 200));
+  const result = await cdpSend(ws, 'Runtime.evaluate', {
+    expression: 'document.documentElement.outerHTML',
+    returnByValue: true,
+  });
+  return result.result.value;
+}
+
+async function closeCdpSession(session, chromeProc) {
+  try { session.ws.close(); } catch {}
+  try { chromeProc.kill(); } catch {}
+}
+
+// --- Fallback: exec per invocation for custom --method ---
+
+function execFetchPage(url) {
+  const cmd = `${method} '${url.replace(/'/g, "'\\''")}'`;
+  try {
+    return execSync(cmd, {
+      encoding: 'utf-8',
+      timeout: 30000,
+      stdio: ['pipe', 'pipe', 'pipe'],
+    });
+  } catch (e) {
+    console.error(`  Failed to fetch: ${url}`);
+    return null;
+  }
+}
+
+// --- Shared utilities ---
+
+function urlToFilePath(urlStr) {
+  const parsed = new URL(urlStr);
+  let pathname = parsed.pathname;
+  if (pathname.endsWith('/')) pathname += 'index.html';
+  if (!path.extname(pathname)) pathname += '/index.html';
+  return path.join(parsed.hostname, pathname);
+}
+
+function savePage(urlStr, html) {
+  const filePath = urlToFilePath(urlStr);
+  fs.mkdirSync(path.dirname(filePath), { recursive: true });
+  fs.writeFileSync(filePath, html, 'utf-8');
+  console.log(`  Saved: ${filePath}`);
+}
+
+function extractLinks(html, baseUrl) {
+  const links = new Set();
+  const hrefRegex = /href\s*=\s*["']([^"'#]+)/gi;
+  let match;
+  while ((match = hrefRegex.exec(html)) !== null) {
+    try { links.add(new URL(match[1], baseUrl).href); }
+    catch {}
+  }
+  return links;
+}
+
+function shouldFollow(urlStr) {
+  try {
+    const parsed = new URL(urlStr);
+    if (parsed.hostname !== startParsed.hostname) return false;
+    if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') return false;
+    if (noParent) {
+      let basePath = startParsed.pathname;
+      if (!basePath.endsWith('/')) basePath = path.posix.dirname(basePath) + '/';
+      if (!parsed.pathname.startsWith(basePath)) return false;
+    }
+    const ext = path.extname(parsed.pathname).toLowerCase();
+    const skip = [
+      '.png', '.jpg', '.jpeg', '.gif', '.svg', '.ico', '.webp',
+      '.css', '.js', '.woff', '.woff2', '.ttf', '.eot',
+      '.pdf', '.zip', '.tar', '.gz', '.mp3', '.mp4', '.avi',
+      '.mov', '.xml', '.json', '.rss', '.atom',
+    ];
+    if (skip.includes(ext)) return false;
+    return true;
+  } catch { return false; }
+}
+
+function normalizeUrl(urlStr) {
+  const parsed = new URL(urlStr);
+  parsed.hash = '';
+  return parsed.href;
+}
+
+// --- Main ---
+
+async function main() {
+  const useCdp = !method;
+  let chromeProc, session, fetchPage;
+
+  console.log(`Starting download from: ${startUrl}`);
+  if (recursive) console.log('Recursive mode enabled');
+  if (noParent) console.log('No-parent mode enabled');
+
+  if (useCdp) {
+    console.log('Method: CDP (single Chrome instance)');
+    console.log('Launching Chrome...');
+    const { proc, wsUrl } = await launchChrome();
+    chromeProc = proc;
+    session = await createCdpSession(wsUrl);
+    console.log('Chrome ready.\n');
+    fetchPage = (url) => cdpFetchPage(session, url).catch((e) => {
+      console.error(`  Failed to fetch: ${url} — ${e.message}`);
+      return null;
+    });
+  } else {
+    console.log(`Method: ${method}`);
+    console.log('');
+    fetchPage = execFetchPage;
+  }
+
+  const visited = new Set();
+  const queue = [normalizeUrl(startUrl)];
+
+  while (queue.length > 0) {
+    const url = queue.shift();
+    if (visited.has(url)) continue;
+    visited.add(url);
+
+    const filePath = urlToFilePath(url);
+    if (fs.existsSync(filePath)) {
+      console.log(`Skipping (exists): ${url}`);
+      if (recursive) {
+        const html = fs.readFileSync(filePath, 'utf-8');
+        for (const link of extractLinks(html, url)) {
+          const normalized = normalizeUrl(link);
+          if (!visited.has(normalized) && shouldFollow(normalized)) {
+            queue.push(normalized);
+          }
+        }
+      }
+      continue;
+    }
+
+    console.log(`Fetching: ${url}`);
+    const html = await fetchPage(url);
+    if (!html) continue;
+
+    savePage(url, html);
+
+    if (recursive) {
+      for (const link of extractLinks(html, url)) {
+        const normalized = normalizeUrl(link);
+        if (!visited.has(normalized) && shouldFollow(normalized)) {
+          queue.push(normalized);
+        }
+      }
+    }
+  }
+
+  console.log(`\nDone. Downloaded ${visited.size} page(s).`);
+
+  if (useCdp) await closeCdpSession(session, chromeProc);
+}
+
+main().catch((e) => {
+  console.error(e.message);
+  process.exit(1);
+});
