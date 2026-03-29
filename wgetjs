@@ -834,7 +834,14 @@ async function main() {
       if (fs.existsSync(filePath)) {
         const stat = fs.statSync(filePath);
         if (stat.isDirectory()) {
-          console.log(`[W${workerIdx}] Skipping (is directory): ${url}`);
+          // Check for index.html in the directory and extract links from it
+          if (recursive) {
+            const indexFile = path.join(filePath, 'index.html');
+            if (fs.existsSync(indexFile)) {
+              const html = fs.readFileSync(indexFile, 'utf-8');
+              enqueueLinks(html, url, depth);
+            }
+          }
           pending--;
           if (pending === 0 && queue.length === 0 && !queue.isDone) queue.finish();
           continue;
