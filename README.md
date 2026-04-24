@@ -124,8 +124,3 @@ wgetjs --method="lightpanda --dump markdown" http://somesite.com/
 wgetjs --method="curl -s {} | tidy -q -" http://somesite.com/
 wgetjs --method="playwright fetch {} --html" http://somesite.com/
 ```
-
-## Requirements
-
-- Node.js
-- Google Chrome (or Chromium) installed and PATH
